@@ -176,7 +176,7 @@ public final class TSystem
                                getGlobusAuthInfo, setAccessRefreshTokens}
   public enum Permission {READ, MODIFY, EXECUTE}
   public enum AuthnMethod {PASSWORD, PKI_KEYS, ACCESS_KEY, TOKEN, CERT}
-  public enum SchedulerType {SLURM, CONDOR, PBS, SGE, UGE, TORQUE}
+  public enum SchedulerType {SLURM, CONDOR, PBS, SGE, UGE, TORQUE, KUBERNETES}
 
   // ************************************************************************
   // *********************** Fields *****************************************
