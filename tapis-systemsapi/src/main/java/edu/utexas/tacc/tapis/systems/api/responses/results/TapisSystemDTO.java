@@ -204,7 +204,9 @@ public final class TapisSystemDTO
       case CAN_EXEC_FIELD -> jsonObject.addProperty(CAN_EXEC_FIELD, Boolean.toString(canExec));
       case CAN_RUN_BATCH_FIELD -> jsonObject.addProperty(CAN_RUN_BATCH_FIELD, Boolean.toString(canRunBatch));
       case ENABLE_CMD_PREFIX_FIELD -> jsonObject.addProperty(ENABLE_CMD_PREFIX_FIELD, Boolean.toString(enableCmdPrefix));
+      case ALLOW_CHILDREN_FIELD -> jsonObject.addProperty(ALLOW_CHILDREN_FIELD, Boolean.toString(allowChildren));
       case MPI_CMD_FIELD -> jsonObject.addProperty(MPI_CMD_FIELD, mpiCmd);
+      case PARENT_ID_FIELD -> jsonObject.addProperty(PARENT_ID_FIELD, parentId);
       case JOB_RUNTIMES_FIELD -> jsonObject.add(JOB_RUNTIMES_FIELD, gson.toJsonTree(jobRuntimes));
       case JOB_WORKING_DIR_FIELD -> jsonObject.addProperty(JOB_WORKING_DIR_FIELD, jobWorkingDir);
       case JOB_ENV_VARIABLES_FIELD -> jsonObject.add(JOB_ENV_VARIABLES_FIELD, gson.toJsonTree(jobEnvVariables));
@@ -220,7 +222,8 @@ public final class TapisSystemDTO
         jsonStr = gson.toJson(notes);
         jsonObject.add(NOTES_FIELD, gson.fromJson(jsonStr, JsonObject.class));
       }
-      case IMPORT_REF_ID -> jsonObject.addProperty(IMPORT_REF_ID, importRefId);
+      // importRefId is not currently used.
+//      case IMPORT_REF_ID -> jsonObject.addProperty(IMPORT_REF_ID, importRefId);
       case UUID_FIELD -> jsonObject.addProperty(UUID_FIELD, uuid.toString());
       case DELETED_FIELD -> jsonObject.addProperty(DELETED_FIELD, Boolean.toString(deleted));
       case CREATED_FIELD -> jsonObject.addProperty(CREATED_FIELD, created.toString());
@@ -228,8 +231,6 @@ public final class TapisSystemDTO
       case IS_PUBLIC_FIELD -> jsonObject.addProperty(IS_PUBLIC_FIELD, Boolean.toString(isPublic));
       case IS_DYNAMIC_EFFECTIVE_USER -> jsonObject.addProperty(IS_DYNAMIC_EFFECTIVE_USER, Boolean.toString(isDynamicEffectiveUser));
       case SHARED_WITH_USERS_FIELD -> jsonObject.add(SHARED_WITH_USERS_FIELD, gson.toJsonTree(sharedWithUsers));
-      case ALLOW_CHILDREN -> jsonObject.addProperty(ALLOW_CHILDREN, Boolean.toString(allowChildren));
-      case PARENT_ID -> jsonObject.addProperty(PARENT_ID, parentId);
     }
   }
 }

@@ -11,7 +11,6 @@ import edu.utexas.tacc.tapis.sharedapi.security.ResourceRequestUser;
 import edu.utexas.tacc.tapis.systems.model.Credential;
 import edu.utexas.tacc.tapis.systems.model.GlobusAuthInfo;
 import edu.utexas.tacc.tapis.systems.model.PatchSystem;
-import edu.utexas.tacc.tapis.systems.model.SchedulerProfile;
 import edu.utexas.tacc.tapis.systems.model.SystemHistoryItem;
 import edu.utexas.tacc.tapis.systems.model.SystemShare;
 import edu.utexas.tacc.tapis.systems.model.TSystem;
@@ -79,7 +78,8 @@ public interface SystemsService
           throws TapisException, TapisClientException;
 
   int getSystemsTotalCount(ResourceRequestUser rUser, List<String> searchList, List<OrderBy> orderByList,
-                           String startAfter, boolean includeDeleted, String listType) throws TapisException, TapisClientException;
+                           String startAfter, boolean includeDeleted, String listType, String impersonationId)
+          throws TapisException, TapisClientException;
 
   List<TSystem> getSystems(ResourceRequestUser rUser, List<String> searchList, int limit, List<OrderBy> orderByList,
                            int skip, String startAfter, boolean includeDeleted, String listType, boolean fetchShareInfo,
@@ -129,30 +129,11 @@ public interface SystemsService
                                    String sessionId)
           throws TapisException, TapisClientException;
 
-  // ------------------- Scheduler Profiles---------------------------------
+  //------------------- Sharing ---------------------------------
   // -----------------------------------------------------------------------
-  void createSchedulerProfile(ResourceRequestUser rUser, SchedulerProfile schedulerProfile)
-          throws TapisException, TapisClientException, IllegalStateException, IllegalArgumentException;
-
-  SchedulerProfile getSchedulerProfile(ResourceRequestUser rUser, String name)
-          throws TapisException;
-
-  List<SchedulerProfile> getSchedulerProfiles(ResourceRequestUser rUser) throws TapisException;
-
-  int deleteSchedulerProfile(ResourceRequestUser rUser, String name)
-          throws TapisException, TapisClientException, IllegalArgumentException;
-
-  boolean checkForSchedulerProfile(ResourceRequestUser rUser, String name)
-          throws TapisException, TapisClientException;
-
-  List<SystemHistoryItem> getSystemHistory(ResourceRequestUser rUser, String systemId)
-          throws TapisException, TapisClientException, IllegalStateException;
-  
   SystemShare getSystemShare(ResourceRequestUser rUser, String systemId)
-      throws TapisException, TapisClientException, IllegalStateException;
-  
-  //------------------- Share ---------------------------------
-  // -----------------------------------------------------------------------
+          throws TapisException, TapisClientException, IllegalStateException;
+
   void shareSystem(ResourceRequestUser rUser, String systemId, SystemShare postShare)
       throws TapisException, TapisClientException, IllegalStateException;
   
@@ -164,4 +145,9 @@ public interface SystemsService
   
   void unshareSystemPublicly(ResourceRequestUser rUser, String systemId) 
       throws TapisException, TapisClientException, IllegalStateException;
+
+  //------------------- History ---------------------------------
+  // -----------------------------------------------------------------------
+  List<SystemHistoryItem> getSystemHistory(ResourceRequestUser rUser, String systemId)
+          throws TapisException, TapisClientException, IllegalStateException;
 }

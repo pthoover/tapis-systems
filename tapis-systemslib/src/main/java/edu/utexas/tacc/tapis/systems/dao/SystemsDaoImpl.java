@@ -147,11 +147,17 @@ public class SystemsDaoImpl implements SystemsDao
       if(!StringUtils.isBlank(system.getParentId())) {
         // in the case of a child system (the parentId is not null) we must guard against race conditions related
         // to the allowChildren flag.  We will read the parent system for update ('lock'), and then check that
-        // allowChildren is true.  This also prevents another possible race conditon where a system may bet deleted
+        // allowChildren is true. This also prevents another possible race condition where a system may get deleted
         // during the creation of the child as well.
         TSystem parentSystem = getSystemForUpdate(db, system.getTenant(), system.getParentId());
-        if((parentSystem == null) || (!parentSystem.isAllowChildren())) {
-          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_SYS_CHILDREN_NOT_PERMITTED", rUser, system.getId()));
+        if (parentSystem == null)
+        {
+          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_PARENT_NOT_FOUND", rUser, opName,
+                                                          system.getParentId(), system.getId()));
+        }
+        if (!parentSystem.isAllowChildren())
+        {
+          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_NOT_PERMITTED", rUser, system.getParentId()));
         }
       }
 
@@ -293,7 +299,7 @@ public class SystemsDaoImpl implements SystemsDao
         // go through.
         TSystem system = getSystemForUpdate(db, tenantId, systemId);
         if((system != null) && hasChildren(tenantId, systemId)) {
-          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_ERROR_PARENT_CHILD_CONFLICT", rUser, systemId));
+          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_ALLOW_CONFLICT_ERROR", rUser, opName, systemId));
         }
       }
 
@@ -417,7 +423,7 @@ public class SystemsDaoImpl implements SystemsDao
         // go through.
         TSystem parentSystem = getSystemForUpdate(db, tenant, systemId);
         if((parentSystem == null) && hasChildren(tenant, systemId)) {
-          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_ERROR_PARENT_CHILD_CONFLICT", rUser, systemId));
+          throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_ALLOW_CONFLICT_ERROR", rUser, opName, systemId));
         }
       }
 
@@ -570,13 +576,19 @@ public class SystemsDaoImpl implements SystemsDao
                         .fetchOne(SYSTEMS.PARENT_ID);
         if(!StringUtils.isBlank(parentId)) {
           TSystem parentSystem = getSystemForUpdate(db, tenantId, parentId);
-          if((parentSystem == null) || (!parentSystem.isAllowChildren())) {
-            // either we couldn't find the parent, or the parent no long is allowing children
-            throw new IllegalStateException(LibUtils.getMsg("SYSLIB_SYS_CHILDREN_NOT_PERMITTED", rUser, id));
+          // Make sure we can still find the parent
+          if (parentSystem == null)
+          {
+            throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_PARENT_NOT_FOUND", rUser, opName, parentId, id));
+          }
+          // Make sure parent still allows children
+          if (!parentSystem.isAllowChildren())
+          {
+            throw new IllegalStateException(LibUtils.getMsg("SYSLIB_CHILD_NOT_PERMITTED", rUser, id));
           }
 
           // we really only need to update a single system - the one that was undeleted.  This method
-          // updatas all children of "parentId", but it should be relatively quick anyway.  If it becomes
+          // updates all children of "parentId", but it should be relatively quick anyway. If it becomes
           // a problem, this is a potential optimization.
           updateChildSystemsFromParent(db, tenantId, parentId);
         }
@@ -637,6 +649,9 @@ public class SystemsDaoImpl implements SystemsDao
     }
   }
 
+  /*
+   * Remove parent id from child system. Used during unlinkFromParent operation.
+   */
   @Override
   public void removeParentId(ResourceRequestUser rUser, String tenantId, String childSystemId) throws TapisException {
     String opName = "removeParentId";
@@ -675,6 +690,9 @@ public class SystemsDaoImpl implements SystemsDao
     }
   }
 
+  /*
+   * Remove parent id from list of child systems. Used during unlinkChildren operation.
+   */
   @Override
   public int removeParentIdFromChildren(ResourceRequestUser rUser, String tenantId, String parentSystemId, List<String> childSystemsToUnlink)
           throws TapisException {
@@ -722,6 +740,9 @@ public class SystemsDaoImpl implements SystemsDao
     }
   }
 
+  /*
+   * Remove parent id from all child systems. Used during unlinkAllChildren operation.
+   */
   @Override
   public int removeParentIdFromAllChildren(ResourceRequestUser rUser, String tenantId, String parentSystemId)
           throws TapisException {
@@ -886,10 +907,10 @@ public class SystemsDaoImpl implements SystemsDao
   }
 
   /**
-   * check to see if the system with id equal systemId has child systms (that are not deleted).
+   * check to see if the system with id equal systemId has child systems (that are not deleted).
    * @param tenantId - id of the tenant
    * @param systemId - id of the system
-   * @return true if the system has child systsms (that have not been deleted), or false if not.
+   * @return true if the system has child systems (that have not been deleted), or false if not.
    * @throws TapisException
    */
   @Override
@@ -1084,6 +1105,7 @@ public class SystemsDaoImpl implements SystemsDao
    *   prior to this call for proper validation and treatment of special characters.
    * WARNING: If both searchList and searchAST provided only searchList is used.
    * @param rUser - ResourceRequestUser containing tenant, user and request info
+   * @param oboUser - since a tenant admin can impersonate, obo User is not always rUser.getOboUser()
    * @param searchList - optional list of conditions used for searching
    * @param searchAST - AST containing search conditions
    * @param orderByList - orderBy entries for sorting, e.g. orderBy=created(desc).
@@ -1096,16 +1118,19 @@ public class SystemsDaoImpl implements SystemsDao
    * @throws TapisException - on error
    */
   @Override
-  public int getSystemsCount(ResourceRequestUser rUser, List<String> searchList, ASTNode searchAST,
+  public int getSystemsCount(ResourceRequestUser rUser, String oboUser, List<String> searchList, ASTNode searchAST,
                              List<OrderBy> orderByList, String startAfter, boolean includeDeleted,
                              AuthListType listType, Set<String> viewableIDs, Set<String> sharedIDs)
           throws TapisException
   {
     // For convenience
     String oboTenant = rUser.getOboTenantId();
-    String oboUser = rUser.getOboUserId();
     boolean allItems = AuthListType.ALL.equals(listType);
     boolean publicOnly = AuthListType.SHARED_PUBLIC.equals(listType);
+    boolean ownedOnly = AuthListType.OWNED.equals(listType);
+
+    // Ensure we have a valid oboUser
+    if (StringUtils.isBlank(oboUser)) oboUser = rUser.getOboUserId();
 
     // If only looking for public items and there are none in the list we are done.
     if (publicOnly && (sharedIDs == null || sharedIDs.isEmpty())) return 0;
@@ -1156,9 +1181,6 @@ public class SystemsDaoImpl implements SystemsDao
     if (includeDeleted) whereCondition = SYSTEMS.TENANT.eq(oboTenant);
     else whereCondition = (SYSTEMS.TENANT.eq(oboTenant)).and(SYSTEMS.DELETED.eq(false));
 
-    // If only selecting items owned by requester we add the condition now.
-    if (AuthListType.OWNED.equals(listType)) whereCondition = whereCondition.and(SYSTEMS.OWNER.eq(oboUser));
-
     // Add searchList or searchAST to where condition
     if (searchList != null)
     {
@@ -1180,13 +1202,32 @@ public class SystemsDaoImpl implements SystemsDao
       whereCondition = addSearchCondStrToWhere(whereCondition, searchStr, "AND");
     }
 
-    // If selecting allItems or publicOnly, add IN condition
-    var setOfIDs = new HashSet<String>();
-    if (allItems && viewableIDs != null) setOfIDs.addAll(viewableIDs);
-    if (allItems && sharedIDs != null) setOfIDs.addAll(sharedIDs);
-    if (publicOnly && sharedIDs != null) setOfIDs.addAll(sharedIDs);
-
-    if (!setOfIDs.isEmpty()) whereCondition = whereCondition.and(SYSTEMS.ID.in(setOfIDs));
+    // Build and add the listType condition:
+    //  OWNED = single condition where owner = oboUser
+    //  PUBLIC = single condition where id in setOfIDs
+    //  ALL = where (owner = oboUser) OR (id in setOfIDs)
+    Condition listTypeCondition = null;
+    if (ownedOnly)
+    {
+      listTypeCondition = SYSTEMS.OWNER.eq(oboUser);
+    }
+    else if (publicOnly)
+    {
+      // NOTE: We check above for sharedIDs == null or is empty so no need to do it here
+      listTypeCondition = SYSTEMS.ID.in(sharedIDs);
+    }
+    else if (allItems)
+    {
+      listTypeCondition = SYSTEMS.OWNER.eq(oboUser);
+      var setOfIDs = new HashSet<String>();
+      if (sharedIDs != null && !sharedIDs.isEmpty()) setOfIDs.addAll(sharedIDs);
+      if (viewableIDs != null && !viewableIDs.isEmpty()) setOfIDs.addAll(viewableIDs);
+      if (!setOfIDs.isEmpty())
+      {
+        listTypeCondition = listTypeCondition.or(SYSTEMS.ID.in(setOfIDs));
+      }
+    }
+    whereCondition = whereCondition.and(listTypeCondition);
 
     // ------------------------- Build and execute SQL ----------------------------
     int count = 0;
@@ -1227,6 +1268,7 @@ public class SystemsDaoImpl implements SystemsDao
    *   prior to this call for proper validation and treatment of special characters.
    * WARNING: If both searchList and searchAST provided only searchList is used.
    * @param rUser - ResourceRequestUser containing tenant, user and request info
+   * @param oboUser - since a tenant admin can impersonate, obo User is not always rUser.getOboUser()
    * @param searchList - optional list of conditions used for searching
    * @param searchAST - AST containing search conditions
    * @param limit - indicates maximum number of results to be included, -1 for unlimited
@@ -2896,15 +2938,14 @@ public class SystemsDaoImpl implements SystemsDao
 	                             r.get(SYSTEM_UPDATES.DESCRIPTION), r.get(SYSTEM_UPDATES.CREATED).toInstant(ZoneOffset.UTC));
   }
 
+  /*
+   * Given a parent system update all inheritable attributes for children
+   */
   private void updateChildSystemsFromParent(DSLContext db, String tenant, String parentId) {
     SystemsRecord systemRecord = (SystemsRecord) db.selectFrom(SYSTEMS)
             .where(SYSTEMS.TENANT.eq(tenant), SYSTEMS.ID.eq(parentId))
             .fetchOne();
-
-    updateChildSystemsFromParent(db, getSystemFromRecord(systemRecord));
-  }
-
-  private void updateChildSystemsFromParent(DSLContext db, TSystem parentSystem) {
+    TSystem parentSystem = getSystemFromRecord(systemRecord);
     // Make sure owner, effectiveUserId, etc are set
     JsonElement jobEnvVariablesJson = TapisGsonUtils.getGson().toJsonTree(parentSystem.getJobEnvVariables());
     JsonElement jobRuntimesJson = TapisGsonUtils.getGson().toJsonTree(parentSystem.getJobRuntimes());
@@ -2946,7 +2987,7 @@ public class SystemsDaoImpl implements SystemsDao
             .set(SYSTEMS.ALLOW_CHILDREN, parentSystem.isAllowChildren())
             .where(SYSTEMS.TENANT.eq(parentSystem.getTenant()), SYSTEMS.PARENT_ID.eq(parentSystem.getId()), SYSTEMS.DELETED.isFalse())
             .execute();
-    log.info("Child Systems Updated:" + rowsUpdated);
+    log.info("Child Systems Updated. Number of rows = " + rowsUpdated);
   }
 
   /*

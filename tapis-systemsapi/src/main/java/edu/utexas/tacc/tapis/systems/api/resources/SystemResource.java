@@ -73,9 +73,11 @@ import edu.utexas.tacc.tapis.systems.api.responses.RespSystemHistory;
 import edu.utexas.tacc.tapis.systems.api.responses.RespSystems;
 import edu.utexas.tacc.tapis.systems.api.utils.ApiUtils;
 import edu.utexas.tacc.tapis.systems.service.SystemsService;
+import edu.utexas.tacc.tapis.systems.model.PatchSystem;
+import edu.utexas.tacc.tapis.systems.model.SystemHistoryItem;
+import edu.utexas.tacc.tapis.systems.model.TSystem;
 import edu.utexas.tacc.tapis.systems.model.TSystem.AuthnMethod;
-import edu.utexas.tacc.tapis.systems.model.*;
-import edu.utexas.tacc.tapis.systems.utils.LibUtils;
+import edu.utexas.tacc.tapis.systems.model.UnlinkInfo;
 
 import static edu.utexas.tacc.tapis.systems.model.Credential.SECRETS_MASK;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.*;
@@ -145,7 +147,7 @@ public class SystemResource {
   // Top level summary attributes to be included by default in some cases.
   public static final List<String> SUMMARY_ATTRS =
           new ArrayList<>(List.of(ID_FIELD, SYSTEM_TYPE_FIELD, OWNER_FIELD, HOST_FIELD,
-                  EFFECTIVE_USER_ID_FIELD, DEFAULT_AUTHN_METHOD_FIELD, CAN_EXEC_FIELD, PARENT_ID));
+                  EFFECTIVE_USER_ID_FIELD, DEFAULT_AUTHN_METHOD_FIELD, CAN_EXEC_FIELD, PARENT_ID_FIELD));
 
   // Default for getSystem
   public static final List<String> DEFAULT_GETSYS_ATTRS = new ArrayList<>(List.of(SEL_ALL_ATTRS));
@@ -249,7 +251,7 @@ public class SystemResource {
       _log.error(msg, e);
       throw new BadRequestException(msg, e);
     }
-    // ------------------------- Create a TSystem from the json and validate constraints -------------------------
+    // ------------------------- Create a TSystem from the json -------------------------
     ReqPostSystem req;
     try { req = TapisGsonUtils.getGson().fromJson(rawJson, ReqPostSystem.class); }
     catch (JsonSyntaxException e)
@@ -274,11 +276,6 @@ public class SystemResource {
     String scrubbedJson = rawJson;
     if (creatingCreds) scrubbedJson = maskCredSecrets(rawJson);
     if (_log.isTraceEnabled()) _log.trace(ApiUtils.getMsgAuth("SYSAPI_CREATE_TRACE", rUser, scrubbedJson));
-
-    // Fill in defaults and check constraints on TSystem attributes
-    tSystem.setDefaults();
-    resp = validateTSystemAtCreate(tSystem, rUser);
-    if (resp != null) return resp;
 
     // ---------------------------- Make service call to create the system -------------------------------
     // Pull out system name for convenience
@@ -333,6 +330,7 @@ public class SystemResource {
     {
       // We only support registering credentials in the static effective user case, so in log messages report effUserId.
       String userName = tSystem.getEffectiveUserId();
+      // Check validation result. Return UNAUTHORIZED (401) if not valid.
       resp = ApiUtils.checkCredValidationResult(rUser, systemId, userName, tSystem.getAuthnCredential(),
                                                 tSystem.getDefaultAuthnMethod(), skipCredCheck);
       if (resp != null) return resp;
@@ -346,6 +344,13 @@ public class SystemResource {
     return createSuccessResponse(Status.CREATED, ApiUtils.getMsgAuth("SYSAPI_CREATED", rUser, systemId), resp1);
   }
 
+  /**
+   * Create a child system given a parent system id
+   * @param payloadStream - request body
+   * @param securityContext - user identity
+   * @param systemId - parent system id
+   * @return response containing reference to created object
+   */
   @POST
   @Path("{systemId}/createChildSystem")
   @Consumes(MediaType.APPLICATION_JSON)
@@ -426,7 +431,6 @@ public class SystemResource {
     respUrl.url = uri.toString();
     return createSuccessResponse(Status.CREATED, ApiUtils.getMsgAuth("SYSAPI_CREATED", rUser, systemId),
             new RespResourceUrl(respUrl));
-
   }
 
   /**
@@ -615,7 +619,7 @@ public class SystemResource {
       throw new BadRequestException(msg, e);
     }
 
-    // ------------------------- Create a System from the json and validate constraints -------------------------
+    // ------------------------- Create a System from the json -------------------------
     ReqPutSystem req;
     try { req = TapisGsonUtils.getGson().fromJson(rawJson, ReqPutSystem.class); }
     catch (JsonSyntaxException e)
@@ -640,10 +644,6 @@ public class SystemResource {
     String scrubbedJson = rawJson;
     if (putSystem.getAuthnCredential() != null) scrubbedJson = maskCredSecrets(rawJson);
     if (_log.isTraceEnabled()) _log.trace(ApiUtils.getMsgAuth("SYSAPI_PUT_TRACE", rUser, scrubbedJson));
-
-    // Fill in defaults and check constraints on TSystem attributes
-    // NOTE: We do not have all the Tapis System attributes yet so we cannot validate it
-    putSystem.setDefaults();
 
     // ---------------------------- Make service call to update the system -------------------------------
     try
@@ -680,6 +680,7 @@ public class SystemResource {
     {
       // We only support registering credentials in the static effective user case, so in log messages report effUserId.
       String userName = putSystem.getEffectiveUserId();
+      // Check validation result. Return UNAUTHORIZED (401) if not valid.
       resp = ApiUtils.checkCredValidationResult(rUser, systemId, userName, putSystem.getAuthnCredential(),
                                                 putSystem.getDefaultAuthnMethod(), skipCredCheck);
       if (resp != null) return resp;
@@ -776,10 +777,11 @@ public class SystemResource {
   }
 
   /**
-   * Unlink a child system from a parent.  This makes the child system a standalone system.
+   * Unlink a child system from a parent. This makes the child system a standalone system.
    * unlinkChild and unlinkFromParent are identical in that they each make a childSystem become a standalone
-   * system.  The difference is in the authorization.  unlinkFromParent requires access to the child.  unlinkChild
-   * requires access to the parent.
+   * system. The difference is in the authorization.
+   * unlinkFromParent requires access to the child.
+   * unlinkChild requires access to the parent.
    *
    * @param childSystemId - id of the child system to unlink
    * @param securityContext - user identity
@@ -789,16 +791,17 @@ public class SystemResource {
   @Path("{childSystemId}/unlinkFromParent")
   @Produces(MediaType.APPLICATION_JSON)
   public Response unlinkFromParent(@PathParam("childSystemId") String childSystemId,
-                               @Context SecurityContext securityContext) throws TapisClientException
+                                   @Context SecurityContext securityContext) throws TapisClientException
   {
     return postSystemSingleUpdate(OP_UNLINK_FROM_PARENT, childSystemId, NO_ADDITIONAL_ARGS, securityContext);
   }
 
   /**
-   * Unlink a child system from a parent.  This makes the child system a standalone system.
+   * Unlink a child system from a parent. This makes the child system a standalone system.
    * unlinkChild and unlinkFromParent are identical in that they each make a childSystem become a standalone
-   * system.  The difference is in the authorization.  unlinkFromParent requires access to the child.  unlinkChild
-   * requires access to the parent.
+   * system. The difference is in the authorization.
+   * unlinkFromParent requires access to the child.
+   * unlinkChild requires access to the parent.
    *
    * @param parentSystemId - id of the parent of the system to unlink
    * @param unlinkInfo - object containing the ids of the child systems to unlink
@@ -810,9 +813,9 @@ public class SystemResource {
   @Produces(MediaType.APPLICATION_JSON)
   @Consumes(MediaType.APPLICATION_JSON)
   public Response unlinkChild(@PathParam("parentSystemId") String parentSystemId,
-                                   @QueryParam("all") @DefaultValue("false") boolean unlinkAll,
-                                   UnlinkInfo unlinkInfo,
-                                   @Context SecurityContext securityContext) throws TapisClientException
+                              @QueryParam("all") @DefaultValue("false") boolean unlinkAll,
+                              UnlinkInfo unlinkInfo,
+                              @Context SecurityContext securityContext) throws TapisClientException
   {
     if(unlinkAll) {
       return postSystemSingleUpdate(OP_UNLINK_ALL_CHILDREN, parentSystemId, NO_ADDITIONAL_ARGS, securityContext);
@@ -1454,77 +1457,6 @@ public class SystemResource {
     return tSystem;
   }
 
-  /**
-   * Check restrictions on TSystem attributes
-   * Use TSystem method to check internal consistency of attributes.
-   * Collect and report as many errors as possible, so they can all be fixed before next attempt
-   * NOTE: JsonSchema validation should handle some of these checks, but we check here again for robustness.
-   *
-   * @return null if OK or error Response
-   */
-  private Response validateTSystemAtCreate(TSystem tSystem1, ResourceRequestUser rUser)
-  {
-    String msg;
-
-    // Make call for lib level validation
-    List<String> errMessages = tSystem1.checkAttributeRestrictions();
-
-    // Now validate attributes that have special handling at API level.
-
-    // If DTN is used (i.e. dtnSystemId is set):
-    //   - verify that dtnSystemId exists
-    //   - verify that rootDir of DTN matches this rootDir.
-    if (!StringUtils.isBlank(tSystem1.getDtnSystemId()))
-    {
-      TSystem dtnSystem = null;
-      try
-      {
-        dtnSystem = service.getSystem(rUser, tSystem1.getDtnSystemId(), null, false, false,
-                         null, null, null, false);
-        // Check for matching rootDir
-        String rootDir = tSystem1.getRootDir();
-        String dtnRootDir = (dtnSystem == null) ? null : dtnSystem.getRootDir();
-        if ( ((dtnRootDir == null && rootDir != null) || (dtnRootDir != null && rootDir == null)) ||
-                (dtnRootDir != null && !dtnRootDir.equals(rootDir)) )
-        {
-          msg = LibUtils.getMsg("SYSLIB_DTN_ROOTDIR_MISMATCH", tSystem1.getDtnSystemId(), dtnRootDir, rootDir);
-          errMessages.add(msg);
-        }
-     }
-      catch (NotAuthorizedException e)
-      {
-        msg = ApiUtils.getMsg("SYSAPI_DTN_401", tSystem1.getDtnSystemId());
-        errMessages.add(msg);
-      }
-      catch (ForbiddenException e)
-      {
-        msg = ApiUtils.getMsg("SYSAPI_DTN_403", tSystem1.getDtnSystemId());
-        errMessages.add(msg);
-      }
-      catch (Exception e)
-      {
-        msg = ApiUtils.getMsg("SYSAPI_DTN_CHECK_ERROR", tSystem1.getDtnSystemId(), e.getMessage());
-        _log.error(msg, e);
-        errMessages.add(msg);
-      }
-      if (dtnSystem == null)
-      {
-        msg = ApiUtils.getMsg("SYSAPI_DTN_NO_SYSTEM", tSystem1.getDtnSystemId());
-        errMessages.add(msg);
-      }
-    }
-
-    // If validation failed log error message and return response
-    if (!errMessages.isEmpty())
-    {
-      // Construct message reporting all errors
-      String allErrors = ApiUtils.getListOfErrors(errMessages, rUser, tSystem1.getId());
-      _log.error(allErrors);
-      throw new BadRequestException(allErrors);
-    }
-    return null;
-  }
-
   /*
    * Extract notes from the incoming json
    * This explicit method to extract is needed because notes is an unstructured object and other seemingly simpler
@@ -1599,10 +1531,10 @@ public class SystemResource {
     List<String> selectList = srchParms.getSelectList();
     if (selectList == null || selectList.isEmpty()) selectList = SUMMARY_ATTRS;
 
-    // If limit was not specified then use the default
+    // If limit or skip not specified then use defaults
     int limit = (srchParms.getLimit() == null) ? SearchParameters.DEFAULT_LIMIT : srchParms.getLimit();
+    int skip = (srchParms.getSkip() == null) ? SearchParameters.DEFAULT_SKIP : srchParms.getSkip();
     // Set some variables to make code easier to read
-    int skip = srchParms.getSkip();
     String startAfter = srchParms.getStartAfter();
     boolean computeTotal = srchParms.getComputeTotal();
     String orderBy = srchParms.getOrderBy();
@@ -1628,7 +1560,8 @@ public class SystemResource {
     //   compared to attempting to fold everything into getSystems().
     if (computeTotal && limit > 0)
     {
-      totalCount = service.getSystemsTotalCount(rUser, searchList, orderByList, startAfter, showDeleted, listType);
+      totalCount = service.getSystemsTotalCount(rUser, searchList, orderByList, startAfter, showDeleted,
+                                                listType, impersonationId);
     }
 
     // ---------------------------- Success -------------------------------
@@ -1648,11 +1581,14 @@ public class SystemResource {
     return Response.status(status).entity(TapisRestUtils.createSuccessResponse(msg, PRETTY, resp)).build();
   }
 
+  /*
+   * Determine if a system is a child of some parent system.
+   */
   private boolean isChildSystem(ResourceRequestUser rUser, String systemId) throws TapisClientException {
     try {
       return !StringUtils.isBlank(service.getParentId(rUser, systemId));
     } catch (NotFoundException | NotAuthorizedException | ForbiddenException | TapisClientException e) {
-      // Pass through not found or not auth to let exception mapper handle it.
+      // Pass through not found or not auth so let exception mapper handle it.
       throw e;
     } catch (Exception e) {
       // As final fallback

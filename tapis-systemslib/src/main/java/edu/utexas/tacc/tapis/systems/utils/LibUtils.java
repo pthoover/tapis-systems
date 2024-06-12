@@ -20,7 +20,7 @@ import edu.utexas.tacc.tapis.systems.model.Credential;
 import edu.utexas.tacc.tapis.systems.model.PatchSystem;
 import edu.utexas.tacc.tapis.systems.model.TSystem;
 
-import static edu.utexas.tacc.tapis.systems.model.TSystem.ALLOW_CHILDREN;
+import static edu.utexas.tacc.tapis.systems.model.TSystem.ALLOW_CHILDREN_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.BATCH_DEFAULT_LOGICAL_QUEUE_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.BATCH_LOGICAL_QUEUES_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.BATCH_SCHEDULER_FIELD;
@@ -45,7 +45,6 @@ import static edu.utexas.tacc.tapis.systems.model.TSystem.JOB_WORKING_DIR_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.MPI_CMD_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.NOTES_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.OWNER_FIELD;
-import static edu.utexas.tacc.tapis.systems.model.TSystem.PARENT_ID;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.PORT_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.PROXY_HOST_FIELD;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.PROXY_PORT_FIELD;
@@ -322,7 +321,7 @@ public class LibUtils
     if (!(o.isDeleted() == n.isDeleted()))
       {noChanges=false;addChange(jo, DELETED_FIELD, o.isDeleted(), n.isDeleted());}
     if (!(o.isAllowChildren() == n.isAllowChildren()))
-      {noChanges=false;addChange(jo, ALLOW_CHILDREN, o.isAllowChildren(), n.isAllowChildren());}
+      {noChanges=false;addChange(jo, ALLOW_CHILDREN_FIELD, o.isAllowChildren(), n.isAllowChildren());}
 
     // ------------------------------------------------------
     // Following attributes require more complex handling
@@ -547,5 +546,51 @@ public class LibUtils
   public static String stripStr(String s)
   {
     if (s == null) return s; else return s.strip();
+  }
+
+  /**
+   * Get all characters after the last newline character is a string.  The string must be non-null and must
+   * already be trimmed of leading and trailing whitespace.
+   * This method is useful in stripping the banner information from the output of remote commands.
+   * Copied from JobUtils in tapis-job repo
+   *
+   * @param resultString the remote result string
+   * @return the last line of the string
+   */
+  public static String getLastLineFromResultString(String resultString)
+  {
+    // The input is a non-null, trimmed string so a non-negative index must be at least one character
+    // from the end of the string.
+    int index = resultString.lastIndexOf('\n');
+    if (index < 0) return resultString;
+    return resultString.substring(index + 1);
+  }
+
+  /*
+   * If DTN is used in a system definition (i.e. dtnSystemId is set):
+   *   - verify that dtnSystemId exists
+   *   - verify that rootDir of DTN matches this rootDir.
+   */
+  public static void validateDtnConfig(TSystem system, TSystem dtnSystem, List<String> errMessages)
+  {
+    String msg;
+    String dtnSystemId = system.getDtnSystemId();
+    if (dtnSystem == null)
+    {
+      msg = LibUtils.getMsg("SYSLIB_DTN_NO_SYSTEM", dtnSystemId);
+      errMessages.add(msg);
+    }
+    else
+    {
+      // Check for matching rootDir
+      String rootDir = system.getRootDir();
+      String dtnRootDir = dtnSystem.getRootDir();
+      if ( ((dtnRootDir == null && rootDir != null) || (dtnRootDir != null && rootDir == null)) ||
+              (dtnRootDir != null && !dtnRootDir.equals(rootDir)) )
+      {
+        msg = LibUtils.getMsg("SYSLIB_DTN_ROOTDIR_MISMATCH", dtnSystemId, dtnRootDir, rootDir);
+        errMessages.add(msg);
+      }
+    }
   }
 }

@@ -9,7 +9,31 @@ https://tapis.readthedocs.io/en/latest/technical/systems.html
 You may also reference live-docs based on the openapi specification here:
 https://tapis-project.github.io/live-docs
 
-## 1.6.1 - 2024-02-09
+## 1.6.3 - 2024-06-11
+
+Incremental improvements. Improved error handling. Refactoring of service implementation.
+
+### New features:
+- None
+
+### Bug fixes:
+- None
+
+---------------------------------------------------------------------------
+## 1.6.2 - 2024-04-24
+
+Incremental improvements and new features.
+
+### New features:
+- Support use of HOST_EVAL in attribute *rootDir* during system creation.
+- Run service in docker container as non-root user.
+- Set default log level to INFO. Allow for dynamic changing of log level.
+
+### Bug fixes:
+- Fix bug where total count might be incorrect for getSystems when a tenant admin impersonates a Tapis user.
+
+---------------------------------------------------------------------------
+## 1.6.1 - 2024-03-06
 
 Incremental improvements and new features
 
@@ -20,6 +44,7 @@ Incremental improvements and new features
 
 ### New features:
 - Allow tenant admin to impersonate a Tapis user when calling getSystem, getSystems.
+- Validate DTN system configuration when a DTN system is specified as part of a system definition.
 
 ### Bug fixes:
 - Add sharing related keywords to list of reserved IDs.
