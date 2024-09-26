@@ -9,6 +9,53 @@ https://tapis.readthedocs.io/en/latest/technical/systems.html
 You may also reference live-docs based on the openapi specification here:
 https://tapis-project.github.io/live-docs
 
+---------------------------------------------------------------------------
+## 1.7.1 - 2024-??-??
+
+TBD
+
+### New features:
+- None
+
+### Bug fixes:
+- None
+
+---------------------------------------------------------------------------
+## 1.7.0 - 2024-09-09
+
+New release
+
+### New features:
+- None
+
+### Bug fixes:
+- None
+
+---------------------------------------------------------------------------
+## 1.6.5 - 2024-09-04
+
+Incremental improvements.
+Update service code to match latest System client model.
+
+### New features:
+- None
+
+### Bug fixes:
+- GET followed by PUT will incorrectly switch effectiveUserId from dynamic to static. Allow but ignore effectiveUserId during PUT.
+
+---------------------------------------------------------------------------
+## 1.6.4 - 2024-08-05
+
+Incremental improvements.
+Add log messages for when access is denied or resource not found.
+
+### New features:
+- None
+
+### Bug fixes:
+- None
+
+---------------------------------------------------------------------------
 ## 1.6.3 - 2024-06-11
 
 Incremental improvements. Improved error handling. Refactoring of service implementation.

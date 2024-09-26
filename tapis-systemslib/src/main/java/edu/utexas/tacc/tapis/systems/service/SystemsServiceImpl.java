@@ -185,7 +185,9 @@ public class SystemsServiceImpl implements SystemsService
     // Check if system already exists
     if (dao.checkForSystem(tenant, systemId, true))
     {
-      throw new IllegalStateException(LibUtils.getMsgAuth("SYSLIB_SYS_EXISTS", rUser, systemId));
+      String msg = LibUtils.getMsgAuth("SYSLIB_SYS_EXISTS", rUser, systemId);
+      log.warn(msg);
+      throw new IllegalStateException(msg);
     }
 
     // ==========================================================================================================
@@ -233,6 +235,7 @@ public class SystemsServiceImpl implements SystemsService
       if (isStaticEffectiveUser && !StringUtils.isBlank(cred.getLoginUser()))
       {
         String msg = LibUtils.getMsgAuth("SYSLIB_CRED_INVALID_LOGINUSER", rUser, systemId);
+        log.warn(msg);
         throw new IllegalArgumentException(msg);
       }
 
@@ -355,12 +358,16 @@ public class SystemsServiceImpl implements SystemsService
                                nullSharedAppCtx, nullResourceTenant, false);
     if (parentSystem == null)
     {
-      throw new NotFoundException(LibUtils.getMsgAuth("SYSLIB_CHILD_PARENT_NOT_FOUND", rUser, opName, parentId, childId));
+      String msg = LibUtils.getMsgAuth("SYSLIB_CHILD_PARENT_NOT_FOUND", rUser, opName, parentId, childId);
+      log.info(msg);
+      throw new NotFoundException(msg);
     }
 
     if (!parentSystem.isAllowChildren())
     {
-      throw new IllegalStateException(LibUtils.getMsgAuth("SYSLIB_CHILD_NOT_PERMITTED", rUser, parentId));
+      String msg = LibUtils.getMsgAuth("SYSLIB_CHILD_NOT_PERMITTED", rUser, parentId);
+      log.warn(msg);
+      throw new IllegalStateException(msg);
     }
 
     if(StringUtils.isBlank(childId)) {
@@ -370,7 +377,9 @@ public class SystemsServiceImpl implements SystemsService
     // Check if system already exists
     if (dao.checkForSystem(parentSystem.getTenant(), childId, true))
     {
-      throw new IllegalStateException(LibUtils.getMsgAuth("SYSLIB_SYS_EXISTS", rUser, childId));
+      String msg = LibUtils.getMsgAuth("SYSLIB_SYS_EXISTS", rUser, childId);
+      log.warn(msg);
+      throw new IllegalStateException(msg);
     }
 
     if (StringUtils.isBlank(childOwner)) { childOwner = rUser.getOboUserId(); }
@@ -413,8 +422,7 @@ public class SystemsServiceImpl implements SystemsService
     }
 
     // System must already exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // if the patch system contains a request to set allowChildren to false, only allow
     // the change if there are no children.
@@ -474,7 +482,7 @@ public class SystemsServiceImpl implements SystemsService
    * Incoming TSystem must contain the tenantId and systemId.
    * Secrets in the text should be masked.
    * Attributes that cannot be updated and so will be looked up and filled in:
-   *   tenant, id, systemType, owner, enabled, bucketName, rootDir, canExec
+   *   tenant, id, systemType, owner, enabled, bucketName, rootDir, canExec, effectiveUserId
    * @param rUser - ResourceRequestUser containing tenant, user and request info
    * @param putSystem - Pre-populated TSystem object (including tenantId and systemId)
    * @param skipCredCheck - Indicates if cred check should happen (for LINUX, S3)
@@ -494,8 +502,6 @@ public class SystemsServiceImpl implements SystemsService
     // Extract some attributes for convenience and clarity
     String oboTenant = rUser.getOboTenantId();
     String systemId = putSystem.getId();
-    SystemType systemType = putSystem.getSystemType();
-    String effectiveUserId = putSystem.getEffectiveUserId();
 
     // ---------------------------- Check inputs ------------------------------------
     if (StringUtils.isBlank(oboTenant) || StringUtils.isBlank(systemId) || StringUtils.isBlank(rawData))
@@ -504,22 +510,20 @@ public class SystemsServiceImpl implements SystemsService
     }
 
     // System must already exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // Fill in defaults
     putSystem.setDefaults();
 
-    // Set flag indicating if effectiveUserId is static
-    boolean isStaticEffectiveUser = !effectiveUserId.equals(APIUSERID_VAR);
-
-    // Set flag indicating if we will deal with credentials.
-    // We only do that when credentials provided and effectiveUser is static
-    Credential cred = putSystem.getAuthnCredential();
-    boolean manageCredentials = (cred != null && isStaticEffectiveUser);
-
     // Retrieve the system being updated and create fully populated TSystem with updated attributes
     TSystem origTSystem = dao.getSystem(oboTenant, systemId);
+
+    // Set flag indicating if effectiveUserId is static
+    String effectiveUserId = origTSystem.getEffectiveUserId();
+    boolean isStaticEffectiveUser = !effectiveUserId.equals(APIUSERID_VAR);
+
+    // Note that effectiveUserId and authnCredential are ignored for PUT, so we do not need to
+    // deal with updating credentials.
 
     // Error if the system we are replacing had a parentId (i.e. - PUT not allowed for a child system) or if
     // the incoming request has a parentId set (i.e. trying to change the system to a child system)
@@ -529,49 +533,12 @@ public class SystemsServiceImpl implements SystemsService
     }
 
     TSystem updatedTSystem = createUpdatedTSystem(origTSystem, putSystem);
-    updatedTSystem.setAuthnCredential(cred);
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuthOwnerKnown(rUser, op, systemId, origTSystem.getOwner());
 
     // ---------------- Check constraints on TSystem attributes ------------------------
     validateTSystem(rUser, updatedTSystem, false);
-
-    // If credentials provided validate constraints and verify credentials
-    if (cred != null)
-    {
-      // Skip check if not LINUX or S3
-      if (!SystemType.LINUX.equals(systemType) && !SystemType.S3.equals(systemType)) skipCredCheck = true;
-
-      // static effectiveUser case. Credential must not contain loginUser
-      // NOTE: If effectiveUserId is dynamic then request has already been rejected above during
-      //       call to validateTSystem(). See method TSystem.checkAttrMisc().
-      //       But we include isStaticEffectiveUser here anyway in case that ever changes.
-      if (isStaticEffectiveUser && !StringUtils.isBlank(cred.getLoginUser()))
-      {
-        String msg = LibUtils.getMsgAuth("SYSLIB_CRED_INVALID_LOGINUSER", rUser, systemId);
-        throw new IllegalArgumentException(msg);
-      }
-
-      // ---------------- Verify credentials if not skipped
-      if (!skipCredCheck && manageCredentials)
-      {
-        Credential c = credUtils.verifyCredentials(rUser, updatedTSystem, cred, cred.getLoginUser(), updatedTSystem.getDefaultAuthnMethod());
-        updatedTSystem.setAuthnCredential(c);
-        // If credential validation failed we do not create the system. Return now.
-        if (Boolean.FALSE.equals(c.getValidationResult())) return updatedTSystem;
-      }
-    }
-
-    // ------------------- Store credentials -----------------------------------
-    // Store credentials in Security Kernel if cred provided and effectiveUser is static
-    if (manageCredentials)
-    {
-      // Use private internal method instead of public API to skip auth and other checks not needed here.
-      // Create credential
-      // Note that we only manageCredentials for the static case and for the static case targetUser=effectiveUserId
-      credUtils.createCredential(rUser, cred, systemId, effectiveUserId, isStaticEffectiveUser);
-    }
 
     // This is a WIP and, in fact, probably not even a good idea to attempt.
     // We should instead generate the change history on demand from the raw data.
@@ -654,13 +621,15 @@ public class SystemsServiceImpl implements SystemsService
       throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT_SYSTEM", rUser));
 
     // System must exist
+    checkForSysWithThrow(rUser, rUser.getOboTenantId(), systemId, true);
     TSystem system = dao.getSystem(rUser.getOboTenantId(), systemId, true);
-    if (system == null)
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    // We just checked for system, so it should never be null. But just in case.
+    if (system == null) return 0;
 
     // cant delete a system if it has children
-    if(dao.hasChildren(rUser.getOboTenantId(), systemId)) {
+    if (dao.hasChildren(rUser.getOboTenantId(), systemId)) {
       String msg = LibUtils.getMsg("SYSLIB_CHILD_HAS_CHILD_ERROR", rUser, systemId);
+      log.warn(msg);
       throw new IllegalStateException(msg);
     }
     // ------------------------- Check authorization -------------------------
@@ -697,14 +666,14 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // System must exist
+    checkForSysWithThrow(rUser, oboTenant, systemId, true);
     TSystem system = dao.getSystem(rUser.getOboTenantId(), systemId, true);
-    if (system == null) {
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
-    }
+    // We just checked for system, so it should never be null. But just in case.
+    if (system == null) return 0;
 
     // if this is a child system, make sure that the parent hasn't been deleted, and that
     // the parent still allows children
-    if(isChildSystem(system)) {
+    if (isChildSystem(system)) {
       boolean okToUndeleteChild = false;
       TSystem parentSystem = dao.getSystem(rUser.getOboTenantId(), system.getParentId(), false);
       if (parentSystem != null) {
@@ -713,8 +682,9 @@ public class SystemsServiceImpl implements SystemsService
         }
       }
 
-      if(!okToUndeleteChild) {
+      if (!okToUndeleteChild) {
         String msg = LibUtils.getMsgAuth("SYSLIB_CHILD_ALLOW_CONFLICT_ERROR", rUser, op.name(), systemId);
+        log.warn(msg);
         throw new IllegalStateException(msg);
       }
     }
@@ -763,8 +733,7 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // System must already exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false))
-         throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // Retrieve old owner
     String oldOwnerName = dao.getSystemOwner(oboTenant, systemId);
@@ -830,10 +799,10 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // System must already exist and not be deleted
+    checkForSysWithThrow(rUser, oboTenant, childSystemId, false);
     TSystem childSystem = dao.getSystem(oboTenant, childSystemId, false);
-    if (childSystem == null) {
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, childSystemId));
-    }
+    // We just checked for system, so it should never be null. But just in case.
+    if (childSystem == null) return 0;
 
     // Get parent's Id
     String parentSystemId = childSystem.getParentId();
@@ -867,12 +836,15 @@ public class SystemsServiceImpl implements SystemsService
 
     // System must already exist and not be deleted
     for(String childSystemId : childIdsToUnlink) {
+      checkForSysWithThrow(rUser, oboTenant, childSystemId, false);
       TSystem childSystem = dao.getSystem(oboTenant, childSystemId, false);
-      if (childSystem == null) {
-        throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, childSystemId));
-      }
-      if(!parentId.equals(childSystem.getParentId())) {
-        throw new NotFoundException(LibUtils.getMsgAuth("SYSLIB_CHILD_CHILD_NOT_FOUND", rUser, parentId, childSystemId));
+      // We just checked for system, so it should never be null. But just in case.
+      if (childSystem == null) return 0;
+      if(!parentId.equals(childSystem.getParentId()))
+      {
+        String msg = LibUtils.getMsgAuth("SYSLIB_CHILD_CHILD_NOT_FOUND", rUser, parentId, childSystemId);
+        log.info(msg);
+        throw new NotFoundException(msg);
       }
     }
 
@@ -899,10 +871,10 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // System must already exist and not be deleted
+    checkForSysWithThrow(rUser, oboTenant, parentId, false);
     TSystem parentSystem = dao.getSystem(oboTenant, parentId, false);
-    if (parentSystem == null) {
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, parentSystem));
-    }
+    // We just checked for system, so it should never be null. But just in case.
+    if (parentSystem == null) return 0;
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuthOwnerKnown(rUser, op, parentId, parentSystem.getOwner());
@@ -1003,8 +975,7 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // Resource must exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuthOwnerUnkown(rUser, op, systemId);
@@ -1095,6 +1066,7 @@ public class SystemsServiceImpl implements SystemsService
     if (requireExecPerm && !system.getCanExec())
     {
       String msg = LibUtils.getMsgAuth("SYSLIB_NOTEXEC", rUser, systemId, op.name());
+      log.warn(msg);
       throw new ForbiddenException(msg);
     }
 
@@ -1340,7 +1312,7 @@ public class SystemsServiceImpl implements SystemsService
     // Process listType. Figure out how we will filter based on authorization. OWNED, ALL, etc.
     // If no listType provided use the default
     if (StringUtils.isBlank(listType)) listType = DEFAULT_LIST_TYPE.name();
-    // Validate the listType enum (case insensitive).
+    // Validate the listType enum (case-insensitive).
     listType = listType.toUpperCase();
     if (!EnumUtils.isValidEnum(AuthListType.class, listType))
     {
@@ -1489,9 +1461,7 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // Resource must exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false)) {
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
-    }
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuthOwnerUnkown(rUser, op, systemId);
@@ -1525,8 +1495,7 @@ public class SystemsServiceImpl implements SystemsService
          throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT", rUser));
 
     // If system does not exist or has been deleted then throw an exception
-    if (!dao.checkForSystem(rUser.getOboTenantId(), systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, rUser.getOboTenantId(), systemId, false);
 
     // NOTE: Previously we did a check here to see if owner is trying to update permissions for themselves.
     // If so we threw an exception because this would be confusing since owner always has full permissions.
@@ -1619,8 +1588,7 @@ public class SystemsServiceImpl implements SystemsService
          throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT", rUser));
 
     // If system does not exist or has been deleted then throw an exception
-    if (!dao.checkForSystem(rUser.getOboTenantId(), systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, rUser.getOboTenantId(), systemId, false);
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuth(rUser, op, systemId, nullOwner, targetUser, nullPermSet);
@@ -1746,6 +1714,25 @@ public class SystemsServiceImpl implements SystemsService
   // ************************************************************************
 
   /**
+   * Use dao to see if system exists. If not throw NOT_FOUND exception.
+   * @param rUser - user making the request
+   * @param resourceTenantId - tenant
+   * @param sysId - system id
+   * @param includeDeleted - indicates if deleted records should be included
+   */
+  private void checkForSysWithThrow(ResourceRequestUser rUser, String resourceTenantId, String sysId,
+                                    boolean includeDeleted)
+          throws TapisException
+  {
+    if (!dao.checkForSystem(resourceTenantId, sysId, includeDeleted))
+    {
+      String msg = LibUtils.getMsgAuth(NOT_FOUND, rUser, sysId);
+      log.info(msg);
+      throw new NotFoundException(msg);
+    }
+  }
+
+  /**
    * Hard delete all systems in the "test" tenant.
    * Also remove artifacts from the Security Kernel.
    * NOTE: This is package-private. Only test code should ever use it.
@@ -1802,8 +1789,7 @@ public class SystemsServiceImpl implements SystemsService
     String oboTenant = rUser.getOboTenantId();
 
     // resource must already exist and not be deleted
-    if (!dao.checkForSystem(oboTenant, systemId, false))
-      throw new NotFoundException(LibUtils.getMsgAuth(NOT_FOUND, rUser, systemId));
+    checkForSysWithThrow(rUser, oboTenant, systemId, false);
 
     // ------------------------- Check authorization -------------------------
     authUtils.checkAuthOwnerUnkown(rUser, sysOp, systemId);
@@ -1850,6 +1836,7 @@ public class SystemsServiceImpl implements SystemsService
     if (TSystem.RESERVED_ID_SET.contains(id.toUpperCase()))
     {
       String msg = LibUtils.getMsgAuth("SYSLIB_CREATE_RESERVED", rUser, id);
+      log.warn(msg);
       throw new IllegalStateException(msg);
     }
   }
@@ -1963,6 +1950,7 @@ public class SystemsServiceImpl implements SystemsService
     if (StringUtils.isBlank(hostEvalParm))
     {
       msg = LibUtils.getMsgAuth("SYSLIB_HOST_EVAL_NO_ENV_VAR", rUser,rootDir);
+      log.warn(msg);
       throw new IllegalArgumentException(msg);
     }
 
@@ -1976,6 +1964,7 @@ public class SystemsServiceImpl implements SystemsService
     if (!m.matches())
     {
       msg = LibUtils.getMsgAuth("SYSLIB_HOST_EVAL_INVALID_ENV_VAR", rUser, systemId, rootDir, hostEvalParm);
+      log.warn(msg);
       throw new IllegalArgumentException(msg);
     }
 
@@ -2006,6 +1995,7 @@ public class SystemsServiceImpl implements SystemsService
       else
       {
         msg = LibUtils.getMsgAuth("SYSLIB_HOST_EVAL_RESOLVE_EMPTY", rUser, systemId, rootDir, varName);
+        log.warn(msg);
         throw new TapisException(msg);
       }
     }
@@ -2065,7 +2055,6 @@ public class SystemsServiceImpl implements SystemsService
 //    tapisSystem.setJobCapabilities(s.getJobCapabilities());
 //    tapisSystem.setTags(s.getTags());
     tapisSystem.setNotes(s.getNotes());
-    tapisSystem.setImportRefId(s.getImportRefId());
 //    tapisSystem.setCreated(s.getCreated());
 //    tapisSystem.setUpdated(s.getUpdated());
     tapisSystem.setUuid(s.getUuid());
@@ -2140,7 +2129,7 @@ public class SystemsServiceImpl implements SystemsService
   /**
    * Create an updated TSystem based on the system created from a PUT request.
    * Attributes that cannot be updated and must be filled in from the original system:
-   *   tenant, id, systemType, owner, enabled, bucketName, rootDir, canExec
+   *   tenant, id, systemType, owner, enabled, bucketName, rootDir, canExec, effectiveUserId
    */
   private static TSystem createUpdatedTSystem(TSystem origSys, TSystem putSys)
   {
@@ -2151,6 +2140,7 @@ public class SystemsServiceImpl implements SystemsService
     updatedSys.setEnabled(origSys.isEnabled());
     updatedSys.setBucketName(origSys.getBucketName());
     updatedSys.setRootDir(origSys.getRootDir());
+    updatedSys.setEffectiveUserId(origSys.getEffectiveUserId());
     return updatedSys;
   }
 
