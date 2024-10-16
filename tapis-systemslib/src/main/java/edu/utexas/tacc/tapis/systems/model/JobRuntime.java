@@ -11,7 +11,7 @@ import java.util.Objects;
  */
 public final class JobRuntime
 {
-  public enum RuntimeType {DOCKER, SINGULARITY, ZIP}
+  public enum RuntimeType {DOCKER, SINGULARITY, ZIP, KUBERNETS}
   private final RuntimeType runtimeType;
   private final String version;
 
