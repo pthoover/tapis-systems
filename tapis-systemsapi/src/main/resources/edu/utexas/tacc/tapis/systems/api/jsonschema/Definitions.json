@@ -14,8 +14,8 @@
   "DirPathNotNull": { "type": "string", "minLength": 1, "maxLength": 4096 },
   "SystemTypeEnum": { "type": "string", "enum": ["LINUX","S3","IRODS","GLOBUS"] },
   "AuthnMethodEnum": { "type": "string", "enum": ["PASSWORD","PKI_KEYS","ACCESS_KEY","TOKEN","CERT"] },
-  "SchedulerTypeEnum": { "type": ["string", "null"], "enum": ["SLURM","CONDOR","PBS","SGE","UGE","TORQUE","KUBERNETES", null] },
-  "SchedulerTypeEnumNotNull": { "type": "string", "enum": ["SLURM","CONDOR","PBS","SGE","UGE","TORQUE","KUBERNETES"] },
+  "SchedulerTypeEnum": { "type": ["string", "null"], "enum": ["SLURM","CONDOR","PBS","SGE","UGE","TORQUE","KUBE_VOYAGER", null] },
+  "SchedulerTypeEnumNotNull": { "type": "string", "enum": ["SLURM","CONDOR","PBS","SGE","UGE","TORQUE","KUBE_VOYAGER"] },
   "SchedulerProfileName": { "type": ["string", "null"], "minLength": 1, "maxLength": 80 },
   "tagsDefinition": {
     "type": "array",
@@ -57,7 +57,7 @@
     "required": [ "runtimeType" ],
     "additionalProperties": false,
     "properties": {
-      "runtimeType": { "type": "string", "enum": ["DOCKER","SINGULARITY", "ZIP"] },
+      "runtimeType": { "type": "string", "enum": ["DOCKER","SINGULARITY", "ZIP", "KUBERNETES"] },
       "version": { "type": ["string", "null"] }
     }
   },
