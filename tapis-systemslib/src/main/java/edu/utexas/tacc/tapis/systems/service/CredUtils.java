@@ -1,22 +1,14 @@
 package edu.utexas.tacc.tapis.systems.service;
 
-import edu.utexas.tacc.tapis.client.shared.exceptions.TapisClientException;
-import edu.utexas.tacc.tapis.security.client.SKClient;
-import edu.utexas.tacc.tapis.security.client.gen.model.SkSecret;
-import edu.utexas.tacc.tapis.security.client.model.*;
-import edu.utexas.tacc.tapis.shared.exceptions.TapisException;
-import edu.utexas.tacc.tapis.shared.exceptions.recoverable.TapisSSHAuthException;
-import edu.utexas.tacc.tapis.shared.s3.S3Connection;
-import edu.utexas.tacc.tapis.shared.security.ServiceClients;
-import edu.utexas.tacc.tapis.shared.ssh.apache.SSHConnection;
-import edu.utexas.tacc.tapis.shared.utils.PathUtils;
-import edu.utexas.tacc.tapis.sharedapi.security.ResourceRequestUser;
-import edu.utexas.tacc.tapis.systems.client.gen.model.AuthnEnum;
-import edu.utexas.tacc.tapis.systems.dao.SystemsDao;
-import edu.utexas.tacc.tapis.systems.model.Credential;
-import edu.utexas.tacc.tapis.systems.model.SystemShare;
-import edu.utexas.tacc.tapis.systems.model.TSystem;
-import edu.utexas.tacc.tapis.systems.utils.LibUtils;
+import javax.inject.Inject;
+import javax.ws.rs.BadRequestException;
+import javax.ws.rs.NotAuthorizedException;
+import javax.ws.rs.NotFoundException;
+import javax.ws.rs.core.Response;
+import java.io.IOException;
+import java.util.*;
+import com.google.gson.JsonObject;
+import okhttp3.*;
 import org.apache.commons.lang3.EnumUtils;
 import org.apache.commons.lang3.StringUtils;
 import org.slf4j.Logger;
@@ -26,12 +18,25 @@ import software.amazon.awssdk.services.s3.model.HeadObjectRequest;
 import software.amazon.awssdk.services.s3.model.NoSuchKeyException;
 import software.amazon.awssdk.services.s3.model.S3Exception;
 
-import javax.inject.Inject;
-import javax.ws.rs.NotAuthorizedException;
-import javax.ws.rs.NotFoundException;
-import javax.ws.rs.core.Response;
-import java.util.*;
-
+import edu.utexas.tacc.tapis.client.shared.exceptions.TapisClientException;
+import edu.utexas.tacc.tapis.security.client.SKClient;
+import edu.utexas.tacc.tapis.security.client.gen.model.SkSecret;
+import edu.utexas.tacc.tapis.security.client.model.*;
+import edu.utexas.tacc.tapis.shared.exceptions.TapisException;
+import edu.utexas.tacc.tapis.shared.exceptions.recoverable.TapisSSHAuthException;
+import edu.utexas.tacc.tapis.shared.s3.S3Connection;
+import edu.utexas.tacc.tapis.shared.security.ServiceClients;
+import edu.utexas.tacc.tapis.shared.ssh.apache.SSHConnection;
+import edu.utexas.tacc.tapis.shared.utils.TapisGsonUtils;
+import edu.utexas.tacc.tapis.shared.utils.PathUtils;
+import edu.utexas.tacc.tapis.sharedapi.security.ResourceRequestUser;
+import edu.utexas.tacc.tapis.systems.client.gen.model.AuthnEnum;
+import edu.utexas.tacc.tapis.systems.config.RuntimeParameters;
+import edu.utexas.tacc.tapis.systems.dao.SystemsDao;
+import edu.utexas.tacc.tapis.systems.model.Credential;
+import edu.utexas.tacc.tapis.systems.model.SystemShare;
+import edu.utexas.tacc.tapis.systems.model.TSystem;
+import edu.utexas.tacc.tapis.systems.utils.LibUtils;
 import static edu.utexas.tacc.tapis.systems.model.Credential.*;
 import static edu.utexas.tacc.tapis.systems.model.TSystem.*;
 import static edu.utexas.tacc.tapis.systems.service.SystemsServiceImpl.*;
@@ -56,6 +61,15 @@ public class CredUtils
   private static final String NO_CHALLENGE = "NoChallenge";
   // String used to detect that credentials are the problem when creating an SSH connection
   private static final String NO_MORE_AUTH_METHODS = "No more authentication methods available";
+
+  // TMS server configuration
+  public static boolean tmsEnabled = false;
+  private static String tmsServerUrl;
+  private static String tmsServerReqUrl;
+  private static String tmsTenant;
+  private static String tmsClientId;
+  private static String tmsClientSecret;
+  private static final String TMS_CREATEKEYS_ENDPOINT = "v1/tms/pubkeys/creds";
 
   // Permission constants
   // Permspec format for systems is "system:<tenant>:<perm_list>:<system_id>"
@@ -85,6 +99,9 @@ public class CredUtils
   // *********************** Fields *****************************************
   // ************************************************************************
 
+  // Http client used to call TMS server
+  private static final OkHttpClient httpClient = new OkHttpClient();
+
   // Use HK2 to inject singletons
   @Inject
   private SystemsDao dao;
@@ -92,6 +109,13 @@ public class CredUtils
   private ServiceClients serviceClients;
   @Inject
   private SysUtils sysUtils;
+
+  // Wrapper for TmsKeys info.
+  public record TmsKeys(String privateKey, String publicKey, String fingerprint) {}
+
+  // Wrapper for TmsRequest info used when creating a key pair
+  public record TmsRequest(String client_user_id, String host, String host_account,
+                           int num_uses, int ttl_minutes) {}
 
   /* **************************************************************************** */
   /*                                Public Methods                                */
@@ -153,41 +177,50 @@ public class CredUtils
 
   /**
    * Store or update credential for given system and target user.
-   * <p>
+   *
    * NOTE that credential returned even if invalid. Caller must check Credential.getValidationResult()
-   * <p>
+   *
    * Secret path depends on whether effUser type is dynamic or static
-   * <p>
+   *
    * If the *effectiveUserId* for the system is dynamic (i.e. equal to *${apiUserId}*) then *targetUser* is interpreted
    * as a Tapis user and the Credential may contain the optional attribute *loginUser* which will be used to map the
    * Tapis user to a username to be used when accessing the system. If the login user is not provided then there is
    * no mapping and the Tapis user is always used when accessing the system.
-   * <p>
+   *
    * If the *effectiveUserId* for the system is static (i.e. not *${apiUserId}*) then *targetUser* is interpreted
    * as the login user to be used when accessing the host.
-   * <p>
+   *
    * For a dynamic TSystem (effUsr=$apiUsr) if targetUser is not the same as the Tapis user and a loginUser has been
    * provided then a loginUser mapping is created.
+   *
+   * If createTmsKeys is true then system must be of type LINUX.
+   * System must also have a dynamic effectiveUserId and loginUser mapping is not allowed.
+   * This is for security reasons. Without these restrictions anyone could create a TMS-enabled system and login
+   *   to the TMS-enabled as someone other than their Tapis user id.
    *
    * @param rUser - ResourceRequestUser containing tenant, user and request info
    * @param system - Tapis system
    * @param targetUser - Target user for operation
    * @param cred - Credentials to be stored
+   * @param createTmsKeys - Indicates if TMS keys should be created and stored
    * @param skipCheck - Indicates if cred check should happen (for LINUX, S3)
    * @param rawData - Client provided text used to create the credential - secrets should be scrubbed. Saved in update record.
    * @return null if skipping credCheck, else checked credential with validation result set
    * @throws TapisException - for Tapis related exceptions
    */
   Credential createCredentialForUser(ResourceRequestUser rUser, TSystem system, String targetUser,
-                                     Credential cred, boolean skipCheck, String rawData)
+                                     Credential cred, boolean createTmsKeys, boolean skipCheck, String rawData)
           throws TapisException, IllegalStateException
   {
     SystemOperation op = SystemOperation.setCred;
-    Credential retCred = null;
+    Credential retCred = null; // Credential to be returned.
+    Credential fullCred = cred; // The full Credential, including TMS keys info if generated.
+    String msg;
     // Extract some attributes for convenience and clarity
     String oboTenant = rUser.getOboTenantId();
     String loginUser = cred.getLoginUser();
     String systemId = system.getId();
+    SystemType systemType = system.getSystemType();
 
     // Determine the effectiveUser type, either static or dynamic
     // Secrets get stored on different paths based on this
@@ -196,20 +229,61 @@ public class CredUtils
     // If private SSH key is set check that we have a compatible key.
     if (!StringUtils.isBlank(cred.getPrivateKey()) && !cred.isValidPrivateSshKey())
     {
-      String msg = LibUtils.getMsgAuth("SYSLIB_CRED_INVALID_PRIVATE_SSHKEY2", rUser, systemId, targetUser);
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_INVALID_PRIVATE_SSHKEY2", rUser, systemId, targetUser);
       log.warn(msg);
       throw new NotAuthorizedException(msg, NO_CHALLENGE);
     }
 
+    // If TMS keys requested check that system allows for it, create the keys and add the keys to the Credential
+    // Note that we must create the keys in the TMS server before verifying the credentials.
+    TmsKeys tmsKeys;
+    if (createTmsKeys)
+    {
+      // Make sure we are configured for TMS support
+      if (!CredUtils.tmsEnabled)
+      {
+        msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_NOT_CFG", rUser, systemId);
+        throw new BadRequestException(msg);
+      }
+      if (!SystemType.LINUX.equals(systemType))
+      {
+        msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_INVALID_SYS_TYPE", rUser, systemId, systemType);
+        throw new BadRequestException(msg);
+      }
+      if (!StringUtils.isBlank(loginUser) || isStaticEffectiveUser)
+      {
+        msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_NOT_ALLOWED", rUser, systemId, loginUser, isStaticEffectiveUser);
+        throw new BadRequestException(msg);
+      }
+      // Call TMS to create the keypair and fingerprint
+      tmsKeys = createTmsKeys(rUser, system, targetUser);
+      // Add TMS keys info the full credential
+      fullCred = new Credential(cred.getAuthnMethod(), cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
+                                cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(),
+                                cred.getAccessToken(), cred.getRefreshToken(),
+                                tmsKeys.privateKey, tmsKeys.publicKey, tmsKeys.fingerprint, cred.getCertificate());
+    }
+
     // Skip check if not LINUX or S3
-    SystemType systemType = system.getSystemType();
     if (!SystemType.LINUX.equals(systemType) && !SystemType.S3.equals(systemType)) skipCheck = true;
 
     // ---------------- Verify credentials ------------------------
     // If not skipping credential validation then do it now
     if (!skipCheck)
     {
-      retCred = verifyCredentials(rUser, system, cred, loginUser, system.getDefaultAuthnMethod());
+      // Determine hostLoginUser. If static or dynamic and no mapping, then use targetUser.
+      String hostLoginUser = targetUser;
+      // If dynamic need to check for host login user mapping.
+      if (!isStaticEffectiveUser)
+      {
+        // Since this is a create operation, the host login user mapping might be in the DB or part of the incoming
+        //   credential or both. The one in the credential has priority because it will be replacing the DB record
+        String mappedLoginUser = cred.getLoginUser();
+        if (StringUtils.isBlank(mappedLoginUser)) mappedLoginUser = dao.getLoginUser(oboTenant, systemId, targetUser);
+        if (!StringUtils.isBlank(mappedLoginUser)) hostLoginUser = mappedLoginUser;
+      }
+      // When creating a cred requesting user does not specify authMethod, so use the one from the system.
+      retCred = verifyCredentials(rUser, system, fullCred, hostLoginUser, system.getDefaultAuthnMethod());
       // If call returns null credential or null validation result then something went wrong.
       if (retCred == null || retCred.getValidationResult() == null) return retCred;
       // Check result. If validation failed return now.
@@ -221,7 +295,7 @@ public class CredUtils
     //   have been changed and reverting seems fraught with peril and not a good ROI.
     try
     {
-      createCredential(rUser, cred, systemId, targetUser, isStaticEffectiveUser);
+      createCredential(rUser, fullCred, systemId, targetUser, isStaticEffectiveUser);
     }
     // If tapis client exception then log error and convert to TapisException
     catch (TapisClientException tce)
@@ -232,13 +306,13 @@ public class CredUtils
 
     // If dynamic and an alternate loginUser has been provided that is not the same as the Tapis user
     //   then record the mapping
-    if (!isStaticEffectiveUser && !StringUtils.isBlank(loginUser) && !targetUser.equals(loginUser))
+    if (!isStaticEffectiveUser && !StringUtils.isBlank(loginUser))
     {
       dao.createOrUpdateLoginUserMapping(oboTenant, systemId, targetUser, loginUser);
     }
 
     // Construct Json string representing the update, with actual secrets masked out
-    Credential maskedCredential = Credential.createMaskedCredential(cred);
+    Credential maskedCredential = Credential.createMaskedCredential(fullCred);
     // Get a complete and succinct description of the update.
     String changeDescription = LibUtils.getChangeDescriptionCredCreate(systemId, targetUser, skipCheck, maskedCredential);
     // Create a record of the update
@@ -287,6 +361,7 @@ public class CredUtils
     // ---------------- Fetch credentials ------------------------
     // Use private internal method instead of public API to skip auth and other checks not needed here.
     Credential cred = getCredential(rUser, system, targetUser, authnMethod, isStaticEffectiveUser, null);
+    // If no credentials then we cannot check, treat it as an error
     if (cred == null)
     {
       String msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_FOUND", rUser, op, systemId, system.getSystemType(),
@@ -295,7 +370,15 @@ public class CredUtils
       throw new NotAuthorizedException(msg, NO_CHALLENGE);
     }
     // ---------------- Verify credentials using defaultAuthnMethod --------------------
-    return verifyCredentials(rUser, system, cred, cred.getLoginUser(), authnMethod);
+    // Determine hostLoginUser. If static or dynamic and no mapping, then use targetUser.
+    String hostLoginUser = targetUser;
+    if (!isStaticEffectiveUser)
+    {
+      // Dynamic eff user, there may be a mapping. Note that targetUser is interpreted as a Tapis user.
+      hostLoginUser = sysUtils.resolveEffectiveUserId(system, targetUser);
+    }
+    // Check credentials
+    return verifyCredentials(rUser, system, cred, hostLoginUser, authnMethod);
   }
 
   /**
@@ -340,36 +423,30 @@ public class CredUtils
   }
 
   /**
-   * Verify that effectiveUserId can connect to the system using provided credentials and authnMethod
+   * Verify that hostLoginUser can connect to the system using provided credentials and authnMethod
+   * May be called during sysCreate, credCreate. Always called during credVerify.
    * <p>
    * NOTE that credential returned even if invalid. Caller must check Credential.getValidationResult()
    * <p>
-   * If loginUser is set then use it for connection,
-   * else if effectiveUserId is ${apUserId} then use rUser.oboUser for connection
-   * else use static effectiveUserId from TSystem for connection
-   * <p>
-   * TSystem and Credential must be provided. If authnMethod not provided it is taken from the System.
+   * TSystem, credential and hostLoginUser must be provided. If authnMethod not provided it is taken from the System.
    *
    * @param rUser - ResourceRequestUser containing tenant, user and request info
    * @param tSystem1 - the TSystem to check
    * @param cred - credentials to check
-   * @param loginUser - host login user from mapping
+   * @param hostLoginUser - username for connection
    * @param authnMethod - AuthnMethod to verify
    * @throws IllegalStateException - if credentials not verified
    */
-  Credential verifyCredentials(ResourceRequestUser rUser, TSystem tSystem1, Credential cred,
-                               String loginUser, AuthnMethod authnMethod)
+  Credential verifyCredentials(ResourceRequestUser rUser, TSystem tSystem1, Credential cred, String hostLoginUser,
+                               AuthnMethod authnMethod)
           throws TapisException
   {
     String op = "verifyCredentials";
-    // Create an initial cred as a fallback to return if there is an error.
-    Credential retCred = new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
-            cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(),
-            cred.getAccessToken(), cred.getRefreshToken(), cred.getCertificate());
     // We must have the system and credentials to check.
     if (rUser == null) throw new IllegalArgumentException(LibUtils.getMsg("SYSLIB_NULL_INPUT_AUTHUSR"));
     if (tSystem1 == null) throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT_SYSTEM", rUser));
     if (cred == null) throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT_CRED1", rUser));
+    if (StringUtils.isBlank(hostLoginUser)) throw new IllegalArgumentException(LibUtils.getMsgAuth("SYSLIB_NULL_INPUT_HOST_LOGIN", rUser));
 
     // If authnMethod not passed in fill in with default from system.
     if (authnMethod == null) authnMethod = tSystem1.getDefaultAuthnMethod();
@@ -378,23 +455,19 @@ public class CredUtils
 
     SystemType systemType = tSystem1.getSystemType();
     String systemId = tSystem1.getId();
-    // Determine user to check
-    // None of the public methods that call this support impersonation so use null for impersonationId
-    String effectiveUser;
-    if (!StringUtils.isBlank(loginUser)) effectiveUser = loginUser;
-    else effectiveUser = sysUtils.resolveEffectiveUserId(tSystem1, rUser.getOboUserId());
 
     // Make sure it is supported for the system type
     if (SystemType.GLOBUS.equals(systemType) || SystemType.IRODS.equals(systemType))
     {
       // Not supported. Return now.
-      String msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, effectiveUser, authnMethod);
+      String msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, hostLoginUser, authnMethod);
       log.info(msg);
-      return new Credential(AuthnMethod.PKI_KEYS, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
+      return new Credential(cred.getAuthnMethod(), cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
               cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(),
-              cred.getAccessToken(), cred.getRefreshToken(), cred.getCertificate(), Boolean.FALSE, msg);
+              cred.getAccessToken(), cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(),
+              cred.getTmsFingerprint(), cred.getCertificate(), Boolean.FALSE, msg);
     }
-    return verifyConnection(rUser, op, tSystem1, authnMethod, cred, effectiveUser);
+    return verifyConnection(rUser, op, tSystem1, authnMethod, cred, hostLoginUser);
   }
 
   /*
@@ -416,7 +489,7 @@ public class CredUtils
    * Secrets for a system follow the format
    *   secret/tapis/tenant/<tenant_id>/<system_id>/user/<static|dynamic>/<target_user>/<key_type>/S1
    * where tenant_id, system_id, user_id, key_type and <static|dynamic> are filled in at runtime.
-   *   key_type is sshkey, password, accesskey, token or cert
+   *   key_type is sshkey, password, accesskey, token, tmskey or cert
    *   and S1 is the reserved SecretName associated with the Systems.
    * Hence, the following code
    *     new SKSecretWriteParms(SecretType.System).setSecretName(TOP_LEVEL_SECRET_NAME)
@@ -427,8 +500,7 @@ public class CredUtils
    * See method writeSecret(String tenant, String user, SKSecretWriteParms parms) in SKClient.java
    * SK uses tenant from payload when constructing the full path for the secret. User from payload not used.
    */
-  void createCredential(ResourceRequestUser rUser, Credential credential,
-                        String systemId, String targetUser, boolean isStatic)
+  void createCredential(ResourceRequestUser rUser, Credential credential, String systemId, String targetUser, boolean isStatic)
           throws TapisClientException, TapisException
   {
     String oboTenant = rUser.getOboTenantId();
@@ -487,6 +559,18 @@ public class CredUtils
       sParms.setData(dataMap);
       sysUtils.getSKClient(rUser).writeSecret(oboTenant, oboUser, sParms);
     }
+    // Store TmsKeys if both public and private keys are present
+    if (!StringUtils.isBlank(credential.getTmsPrivateKey()) && !StringUtils.isBlank(credential.getTmsPublicKey()))
+    {
+      dataMap = new HashMap<>();
+      sParms.setKeyType(KeyType.tmskey);
+      dataMap.put(SK_KEY_TMS_PUBLIC_KEY, credential.getTmsPublicKey());
+      dataMap.put(SK_KEY_TMS_PRIVATE_KEY, credential.getTmsPrivateKey());
+      dataMap.put(SK_KEY_TMS_FINGERPRINT, credential.getTmsFingerprint());
+      sParms.setData(dataMap);
+      String privKey = StringUtils.isBlank(credential.getTmsPrivateKey()) ? null : "*****";
+      sysUtils.getSKClient(rUser).writeSecret(oboTenant, oboUser, sParms);
+    }
     // NOTE if necessary handle ssh certificate when supported
   }
 
@@ -523,6 +607,9 @@ public class CredUtils
     sMetaParms.setKeyType(KeyType.token);
     try { sysUtils.getSKClient(rUser).readSecretMeta(sMetaParms); secretNotFound = false; }
     catch (Exception e) { log.trace(e.getMessage()); }
+    sMetaParms.setKeyType(KeyType.tmskey);
+    try { sysUtils.getSKClient(rUser).readSecretMeta(sMetaParms); secretNotFound = false; }
+    catch (Exception e) { log.trace(e.getMessage()); }
     if (secretNotFound) return 0;
 
     // Construct basic SK secret parameters and attempt to destroy each type of secret.
@@ -537,6 +624,9 @@ public class CredUtils
     try { sysUtils.getSKClient(rUser).destroySecretMeta(sMetaParms); }
     catch (Exception e) { log.trace(e.getMessage()); }
     sMetaParms.setKeyType(KeyType.token);
+    try { sysUtils.getSKClient(rUser).destroySecretMeta(sMetaParms); }
+    catch (Exception e) { log.trace(e.getMessage()); }
+    sMetaParms.setKeyType(KeyType.tmskey);
     try { sysUtils.getSKClient(rUser).destroySecretMeta(sMetaParms); }
     catch (Exception e) { log.trace(e.getMessage()); }
     return 1;
@@ -573,7 +663,7 @@ public class CredUtils
      * Secrets for a system follow the format
      *   secret/tapis/tenant/<tenant_id>/<system_id>/user/<static|dynamic>/<target_user>/<key_type>/S1
      * where tenant_id, system_id, user_id, key_type and <static|dynamic> are filled in at runtime.
-     *   key_type is sshkey, password, accesskey, token or cert
+     *   key_type is sshkey, password, accesskey, token, tmskey or cert
      *   and S1 is the reserved SecretName associated with the Systems.
      *
      * Hence, the following code
@@ -598,16 +688,17 @@ public class CredUtils
       // NOTE: For secrets of type "system" setUser value not used in the path, but SK requires that it be set.
       sParms.setUser(oboUser);
       // Set key type based on authn method
-      if (authnMethod.equals(AuthnMethod.PASSWORD))sParms.setKeyType(KeyType.password);
-      else if (authnMethod.equals(AuthnMethod.PKI_KEYS))sParms.setKeyType(KeyType.sshkey);
-      else if (authnMethod.equals(AuthnMethod.ACCESS_KEY))sParms.setKeyType(KeyType.accesskey);
-      else if (authnMethod.equals(AuthnMethod.TOKEN))sParms.setKeyType(KeyType.token);
-      else if (authnMethod.equals(AuthnMethod.CERT))sParms.setKeyType(KeyType.cert);
+      if (authnMethod.equals(AuthnMethod.PASSWORD))        sParms.setKeyType(KeyType.password);
+      else if (authnMethod.equals(AuthnMethod.PKI_KEYS))   sParms.setKeyType(KeyType.sshkey);
+      else if (authnMethod.equals(AuthnMethod.ACCESS_KEY)) sParms.setKeyType(KeyType.accesskey);
+      else if (authnMethod.equals(AuthnMethod.TOKEN))      sParms.setKeyType(KeyType.token);
+      else if (authnMethod.equals(AuthnMethod.TMS_KEYS))   sParms.setKeyType(KeyType.tmskey);
+      else if (authnMethod.equals(AuthnMethod.CERT))       sParms.setKeyType(KeyType.cert);
 
       // Retrieve the secrets
       SkSecret skSecret = sysUtils.getSKClient(rUser).readSecret(sParms);
       if (skSecret == null) return null;
-      var dataMap = skSecret.getSecretMap();
+      Map<String, String> dataMap = skSecret.getSecretMap();
       if (dataMap == null) return null;
 
       // Determine the loginUser associated with the credential.
@@ -639,6 +730,9 @@ public class CredUtils
               dataMap.get(SK_KEY_ACCESS_SECRET),
               dataMap.get(SK_KEY_ACCESS_TOKEN),
               dataMap.get(SK_KEY_REFRESH_TOKEN),
+              dataMap.get(SK_KEY_TMS_PRIVATE_KEY),
+              dataMap.get(SK_KEY_TMS_PUBLIC_KEY),
+              dataMap.get(SK_KEY_TMS_FINGERPRINT),
               null); //dataMap.get(CERT) NOTE: get ssh certificate when supported
     }
     catch (TapisClientException tce)
@@ -650,7 +744,14 @@ public class CredUtils
     return credential;
   }
 
-  // Build a TapisSystem client credential based on the TSystem model credential
+  /**
+   * Build a TapisSystem client credential based on the TSystem model credential
+   * Needed for shared code that expects to use the java wrapper client generated credential model.
+   *
+   * @param cred Credential from Systems service model object
+   * @param authnMethod Authentication method
+   * @return TapisSystem Java wrapper client credential
+   */
   static edu.utexas.tacc.tapis.systems.client.gen.model.Credential buildAuthnCred(Credential cred, AuthnMethod authnMethod)
   {
     if (cred == null) return null;
@@ -665,24 +766,174 @@ public class CredUtils
     c.setPrivateKey(cred.getPrivateKey());
     c.setAccessToken(cred.getAccessToken());
     c.setRefreshToken(cred.getRefreshToken());
+    c.setTmsPublicKey(cred.getTmsPublicKey());
+    c.setTmsPrivateKey(cred.getTmsPrivateKey());
+    c.setTmsFingerprint(cred.getTmsFingerprint());
     c.setCertificate(cred.getCertificate());
     c.setLoginUser(cred.getLoginUser());
     return c;
+  }
+
+  /*
+   * Check to see if TMS is configured. Set flag.
+   */
+  public static void initTmsConfiguration()
+  {
+    RuntimeParameters runtimeParms = RuntimeParameters.getInstance();
+    tmsEnabled = runtimeParms.getTmsEnalbed();
+    tmsServerUrl = runtimeParms.getTmsServerUrl();
+    tmsTenant = runtimeParms.getTmsTenant();
+    tmsClientId = runtimeParms.getTmsClientId();
+    tmsClientSecret = runtimeParms.getTmsClientSecret();
+    String tmsClientSecretMasked = StringUtils.isBlank(tmsClientSecret) ? tmsClientSecret : SECRETS_MASK;
+    if (tmsEnabled && !StringUtils.startsWith(tmsServerUrl, "http"))
+    {
+      System.out.println(LibUtils.getMsg("SYSLIB_INIT_TMS_URL_ERR", tmsServerUrl));
+      tmsEnabled = false;
+    }
+    tmsServerReqUrl = String.format("%s/%s", tmsServerUrl, TMS_CREATEKEYS_ENDPOINT);
+    // Log final result
+    System.out.println(LibUtils.getMsg("SYSLIB_INIT_TMS_CFG", tmsEnabled, tmsServerUrl, tmsTenant, tmsClientId,
+                                       tmsClientSecretMasked));
   }
 
   /* **************************************************************************** */
   /*                                Private Methods                               */
   /* **************************************************************************** */
 
+  /**
+   * Call the TMS server to generate a TMS keypair and fingerprint.
+   * Example: curl -k -X POST -H "content-type: application/json" \
+   *           -H "X-TMS-TENANT: $TMS_TENANT"
+   *           -H "X-TMS-CLIENT-ID: $TMS_CLIENT_ID" \
+   *           -H "X-TMS-CLIENT-SECRET: $TMS_CLIENT_KEY" \
+   *           $TMS_URL/v1/tms/pubkeys/creds -d @$1
+   * Example req body
+   * { "client_user_id": "testuser1", "host": "testhost1", "host_account": "testhostaccount1",
+   *   "num_uses": -1, "ttl_minutes": -1}
+   *
+   * @param rUser ResourceRequest user
+   * @param system Tapis system
+   * @param targetUser Host account user
+   * @return tms key info
+   * @throws TapisException on error
+   */
+  private TmsKeys createTmsKeys(ResourceRequestUser rUser, TSystem system, String targetUser)
+          throws TapisException
+  {
+    RuntimeParameters runtimeParms = RuntimeParameters.getInstance();
+    // Call TMS to generate the keypair and fingerprint
+    // Example:
+    //    tmsServerReqUrl = "https://tms-server-stage.tacc.utexas.edu:3000/v1/tms/pubkeys/creds";
+    //    tmsTenant = "test";
+    //    tmsClientId = "testclient1";
+    //    tmsClientSecret = "secret1";
+    //    String tmsClientUser = "testuser1";
+    //    String tmsHost = "testhost1";
+    //    String tmsHostAccount = "testhostaccount1";
+    String tmsClientUser = rUser.getOboUserId();
+    String tmsHost = system.getHost();
+    String tmsHostAccount = targetUser;
+    int numUses = -1;
+    int ttlMinutes = -1;
+    // Build the request
+    var tmsRequest = new TmsRequest(tmsClientUser, tmsHost, tmsHostAccount, numUses, ttlMinutes);
+    String reqJsonStr = TapisGsonUtils.getGson(true).toJson(tmsRequest);
+    RequestBody body = RequestBody.create(reqJsonStr, MediaType.parse("application/json"));
+    Request.Builder requestBuilder = new Request.Builder().url(tmsServerReqUrl).post(body);
+
+    // Add headers for tenant, client id and client secret
+    Request request = requestBuilder.addHeader("X-TMS-TENANT", tmsTenant)
+            .addHeader("X-TMS-CLIENT-ID", tmsClientId)
+            .addHeader("X-TMS-CLIENT-SECRET", tmsClientSecret)
+            .build();
+    Call call = httpClient.newCall(request);
+    String msg = null;
+    String respBodyStr = null;
+    int httpRespCode = -1;
+    try
+    {
+      // Send the request to the REST endpoint
+      // Use try-with-resources to auto-close the response.
+      log.debug(LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_REQ", rUser, system.getId(), targetUser, tmsServerUrl));
+      try (okhttp3.Response response = call.execute())
+      {
+        // Get the response body as a string
+        if (response.body() != null) respBodyStr = response.body().string();
+        // If response status code is not in the 200s it is an error
+        httpRespCode = response.code();
+        if (httpRespCode < 200 || httpRespCode >= 300)
+        {
+          msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_HTTP_ERR", rUser, system.getId(), targetUser,
+                                    tmsServerUrl, httpRespCode, respBodyStr);
+          log.error(msg);
+        }
+      }
+    }
+    catch (IOException e)
+    {
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_ERR", rUser, system.getId(), targetUser, tmsServerUrl, e.getMessage());
+      log.error(msg);
+    }
+
+    // On error throw TapisException
+    if (!StringUtils.isBlank(msg))
+    {
+      throw new TapisException(msg);
+    }
+
+    // If response body was empty or null it is an error
+    if (StringUtils.isBlank(respBodyStr))
+    {
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_NO_BODY", rUser, system.getId(), targetUser, tmsServerUrl, httpRespCode);
+      log.error(msg);
+      throw new TapisException(msg);
+    }
+
+    // We should have a json response body with the keypair and fingerprint. Extract them.
+    JsonObject respBodyJson = TapisGsonUtils.getGson().fromJson(respBodyStr, JsonObject.class);
+    var privateKeyObj = respBodyJson.get("private_key");
+    var publicKeyObj = respBodyJson.get("public_key");
+    var publicKeyFingerprintObj = respBodyJson.get("public_key_fingerprint");
+    // If any are null it is an error
+    if (privateKeyObj == null || publicKeyObj == null || publicKeyFingerprintObj == null)
+    {
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_NULL_FIELD", rUser, system.getId(), targetUser, tmsServerUrl, httpRespCode,
+                                 privateKeyObj == null ? "null" : "non-null",
+                                 publicKeyObj == null ? "null" : "non-null",
+                                 publicKeyFingerprintObj == null ? "null" : "non-null");
+      log.error(msg);
+      throw new TapisException(msg);
+    }
+    String tmsPrivateKey = privateKeyObj.getAsString();
+    String tmsPublicKey = publicKeyObj.getAsString();
+    String tmsPublicKeyFingerprint = publicKeyFingerprintObj.getAsString();
+    String privateKeyMasked = StringUtils.isBlank(tmsPrivateKey) ? null : SECRETS_MASK;
+    // If any are empty it is an error
+    if (StringUtils.isBlank(tmsPrivateKey) || StringUtils.isBlank(tmsPublicKey) || StringUtils.isBlank(tmsPublicKeyFingerprint))
+    {
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_EMPTY_FIELD", rUser, system.getId(), targetUser, tmsServerUrl,
+                                httpRespCode, privateKeyMasked, tmsPublicKey, tmsPublicKeyFingerprint);
+      log.error(msg);
+      throw new TapisException(msg);
+    }
+
+    // Log extracted data
+    msg = LibUtils.getMsgAuth("SYSLIB_CRED_TMS_KEYS_DATA", rUser, system.getId(), targetUser, privateKeyMasked,
+                              tmsPublicKey, tmsPublicKeyFingerprint);
+    log.debug(msg);
+    return new TmsKeys(tmsPrivateKey, tmsPublicKey, tmsPublicKeyFingerprint);
+  }
+
   /*
    * Verify connection based on authentication method
    * NOTE that credential returned even if invalid. Caller must check Credential.getValidationResult()
    */
   private Credential verifyConnection(ResourceRequestUser rUser, String op, TSystem tSystem1, AuthnMethod authnMethod,
-                                      Credential cred, String effectiveUser)
+                                      Credential cred, String hostLoginUser)
   {
     log.info(LibUtils.getMsgAuth("SYSLIB_CRED_VERIFY_START", rUser, tSystem1.getId(), tSystem1.getSystemType(),
-             effectiveUser, authnMethod));
+             hostLoginUser, authnMethod));
     Credential retCred;
     String systemId = tSystem1.getId();
     String host = tSystem1.getHost();
@@ -690,30 +941,36 @@ public class CredUtils
     SystemType systemType = tSystem1.getSystemType();
     String bucket = tSystem1.getBucketName();
     // For convenience and clarity, set a few booleans
-    boolean doingLinux = AuthnMethod.PKI_KEYS.equals(authnMethod) || AuthnMethod.PASSWORD.equals(authnMethod);
+    boolean doingLinux = AuthnMethod.PKI_KEYS.equals(authnMethod) ||
+                         AuthnMethod.PASSWORD.equals(authnMethod) ||
+                         AuthnMethod.TMS_KEYS.equals(authnMethod);
     boolean doingPki = AuthnMethod.PKI_KEYS.equals(authnMethod);
     boolean doingPassword = AuthnMethod.PASSWORD.equals(authnMethod);
     boolean doingAccessKey = AuthnMethod.ACCESS_KEY.equals(authnMethod);
+    boolean doingTms = AuthnMethod.TMS_KEYS.equals(authnMethod);
     String msg = "No Errors";
     String validationResult;
     if ((doingLinux && !SystemType.LINUX.equals(systemType)) || (doingAccessKey && !SystemType.S3.equals(systemType)))
     {
-      // System is not LINUX. Not supported.
-      msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, effectiveUser, authnMethod);
+      // System type not supported.
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, hostLoginUser, authnMethod);
       retCred = new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
               cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(), cred.getAccessToken(),
-              cred.getRefreshToken(), cred.getCertificate(), Boolean.FALSE, msg);
+              cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(), cred.getTmsFingerprint(),
+              cred.getCertificate(), Boolean.FALSE, msg);
       validationResult = "FAILED";
     }
     else if ((doingPki && (StringUtils.isBlank(cred.getPublicKey()) || StringUtils.isBlank(cred.getPrivateKey()))) ||
             (doingPassword && StringUtils.isBlank(cred.getPassword())) ||
-            (doingAccessKey && (StringUtils.isBlank(cred.getAccessKey()) || StringUtils.isBlank(cred.getAccessSecret()))))
+            (doingAccessKey && (StringUtils.isBlank(cred.getAccessKey()) || StringUtils.isBlank(cred.getAccessSecret()))) ||
+            (doingTms && (StringUtils.isBlank(cred.getTmsPrivateKey()) || StringUtils.isBlank(cred.getTmsPublicKey()))))
     {
       // We do not have the credentials we need
-      msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_FOUND", rUser, op, systemId, systemType, effectiveUser, authnMethod);
+      msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_FOUND", rUser, op, systemId, systemType, hostLoginUser, authnMethod);
       retCred = new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
               cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(), cred.getAccessToken(),
-              cred.getRefreshToken(), cred.getCertificate(), Boolean.FALSE, msg);
+              cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(), cred.getTmsFingerprint(),
+              cred.getCertificate(), Boolean.FALSE, msg);
       validationResult = "FAILED";
     }
     else
@@ -722,22 +979,22 @@ public class CredUtils
       // Try to handle as many exceptions as we can. For this reason, in each case there is a final catch of Exception
       //   which is re-thrown as a TapisException.
       log.info(LibUtils.getMsgAuth("SYSLIB_CRED_VERIFY_CONN", rUser, tSystem1.getId(), tSystem1.getSystemType(), host,
-              effectiveUser, port, authnMethod));
+              hostLoginUser, port, authnMethod));
       TapisException te = null;
       switch(authnMethod)
       {
         case PASSWORD:
-          try (SSHConnection c = new SSHConnection(host, port, effectiveUser, cred.getPassword())) { te = null; }
+          try (SSHConnection c = new SSHConnection(host, port, hostLoginUser, cred.getPassword())) { te = null; }
           catch (TapisException e) { te = e; }
           catch (Exception e) { te = new TapisException(e.getMessage(), e); }
           break;
         case PKI_KEYS:
-          try (SSHConnection c = new SSHConnection(host, port, effectiveUser, cred.getPublicKey(), cred.getPrivateKey())) { te = null; }
+          try (SSHConnection c = new SSHConnection(host, port, hostLoginUser, cred.getPublicKey(), cred.getPrivateKey())) { te = null; }
           catch (TapisException e) { te = e; }
           catch (Exception e) { te = new TapisException(e.getMessage(), e); }
           break;
         case ACCESS_KEY:
-          try (S3Connection c = new S3Connection(host, port, bucket, effectiveUser, cred.getAccessKey(), cred.getAccessSecret()))
+          try (S3Connection c = new S3Connection(host, port, bucket, hostLoginUser, cred.getAccessKey(), cred.getAccessSecret()))
           {
             // For S3 we need to actually try to use the connection to know that the credentials are valid.
             String testKey = PathUtils.getAbsoluteKey(tSystem1.getRootDir(), "thisKeyIsUnlikelyToExistButIfItDoesThatIsOkay");
@@ -757,13 +1014,19 @@ public class CredUtils
             te = e;
           }
           break;
+        case TMS_KEYS:
+          try (SSHConnection c = new SSHConnection(host, port, hostLoginUser, cred.getTmsPublicKey(), cred.getTmsPrivateKey())) { te = null; }
+          catch (TapisException e) { te = e; }
+          catch (Exception e) { te = new TapisException(e.getMessage(), e); }
+          break;
         default:
           // We should never get here, but just in case fail the verification
-          msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, effectiveUser, authnMethod);
+          msg = LibUtils.getMsgAuth("SYSLIB_CRED_NOT_SUPPORTED", rUser, systemId, systemType, hostLoginUser, authnMethod);
           log.error(msg);
           return new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
                   cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(), cred.getAccessToken(),
-                  cred.getRefreshToken(), cred.getCertificate(), Boolean.FALSE, msg);
+                  cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(), cred.getTmsFingerprint(),
+                  cred.getCertificate(), Boolean.FALSE, msg);
       }
 
       // We have made the connection attempt. Check the result.
@@ -773,7 +1036,8 @@ public class CredUtils
         // No problem with connection. Set result to TRUE
         retCred = new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
                 cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(), cred.getAccessToken(),
-                cred.getRefreshToken(), cred.getCertificate(), Boolean.TRUE, null);
+                cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(), cred.getTmsFingerprint(),
+                cred.getCertificate(), Boolean.TRUE, null);
       }
       else
       {
@@ -787,28 +1051,29 @@ public class CredUtils
         {
           // There was a special message in an SSH connection exception indicating credentials invalid.
           msg = LibUtils.getMsgAuth("SYSLIB_CRED_VALID_FAIL", rUser, tSystem1.getId(), tSystem1.getSystemType(), host,
-                  effectiveUser, authnMethod, cause.getMessage());
+                  hostLoginUser, authnMethod, cause.getMessage());
         }
         else if (cause instanceof S3Exception && Response.Status.FORBIDDEN.getStatusCode() == ((S3Exception) cause).statusCode())
         {
           // S3 connections return status of 403 when credentials invalid.
           msg = LibUtils.getMsgAuth("SYSLIB_CRED_VALID_FAIL", rUser, tSystem1.getId(), tSystem1.getSystemType(), host,
-                  effectiveUser, authnMethod, cause.getMessage());
+                  hostLoginUser, authnMethod, cause.getMessage());
         }
         else
         {
           // There was a general connection failure that we do not specifically detect.
           // Are there any other special messages for S3 or SSH?
           msg = LibUtils.getMsgAuth("SYSLIB_CRED_CONN_FAIL", rUser, tSystem1.getId(), tSystem1.getSystemType(), host,
-                  effectiveUser, authnMethod, eMsg);
+                  hostLoginUser, authnMethod, eMsg);
         }
         retCred = new Credential(authnMethod, cred.getLoginUser(), cred.getPassword(), cred.getPrivateKey(),
                 cred.getPublicKey(), cred.getAccessKey(), cred.getAccessSecret(), cred.getAccessToken(),
-                cred.getRefreshToken(), cred.getCertificate(), Boolean.FALSE, msg);
+                cred.getRefreshToken(), cred.getTmsPrivateKey(), cred.getTmsPublicKey(), cred.getTmsFingerprint(),
+                cred.getCertificate(), Boolean.FALSE, msg);
       }
     }
     log.info(LibUtils.getMsgAuth("SYSLIB_CRED_VERIFY_END", rUser, tSystem1.getId(), tSystem1.getSystemType(),
-            effectiveUser, authnMethod, validationResult, msg));
+            hostLoginUser, authnMethod, validationResult, msg));
     return retCred;
   }
 
